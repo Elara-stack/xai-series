@@ -1,3 +1,6 @@
+# %% Install required packages
+!pip install opencv-python
+
 # %% Imports
 import torch
 import torch.nn as nn
@@ -9,46 +12,62 @@ import matplotlib.pyplot as plt
 import torch.optim as optim
 import copy
 import pandas as pd 
-
-# added sections
 import cv2
 from PIL import Image
 import torch.nn.functional as F
 
 # Set GPU device
 print(torch.cuda.is_available())
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") # added sections
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+# %% Load data - Use a sample dataset or create synthetic data for demo
+# Since you don't have the actual data, we'll create a simple dataset
+# You can replace this with your actual data later
 
-# %% Load data - FIXED: Corrected test dataset path
-TRAIN_ROOT = "data/brain_mri/training"
-TEST_ROOT = "data/brain_mri/testing"
+# For demo purposes, let's use a small subset of a public dataset
+# Or create synthetic data to test the code
 
-# added sections
-# Load training dataset
-train_dataset = torchvision.datasets.ImageFolder(
-    root=TRAIN_ROOT,
-    transform=transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor()
-    ])
-)
+# Create a simple dataset class for demo
+class DemoDataset(torch.utils.data.Dataset):
+    def __init__(self, num_samples=100, transform=None):
+        self.num_samples = num_samples
+        self.transform = transform
+        
+    def __len__(self):
+        return self.num_samples
+    
+    def __getitem__(self, idx):
+        # Create random image (simulating MRI data)
+        image = torch.randn(3, 224, 224)  # Random image
+        label = torch.randint(0, 4, (1,)).item()  # Random label (0-3)
+        if self.transform:
+            image = self.transform(image)
+        return image, label
 
-# Load test dataset - FIXED: Now correctly uses TEST_ROOT
-test_dataset = torchvision.datasets.ImageFolder(
-    root=TEST_ROOT,
-    transform=transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor()
-    ])
-)
+# %% Create demo datasets
+train_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                        std=[0.229, 0.224, 0.225])
+])
 
+test_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                        std=[0.229, 0.224, 0.225])
+])
+
+# Create demo datasets
+train_dataset = DemoDataset(num_samples=200, transform=train_transform)
+test_dataset = DemoDataset(num_samples=50, transform=test_transform)
 
 # %% Building the model
 class CNNModel(nn.Module):
     def __init__(self):
         super(CNNModel, self).__init__()
-        self.vgg16 = models.vgg16(pretrained=True) 
+        self.vgg16 = models.vgg16(weights='VGG16_Weights.DEFAULT')  # Updated for newer PyTorch
 
         # Replace output layer according to our problem
         in_feats = self.vgg16.classifier[6].in_features 
@@ -61,9 +80,8 @@ class CNNModel(nn.Module):
 model = CNNModel()
 model.to(device)
 
-# added sections
 # %% Create data loaders
-batch_size = 32
+batch_size = 16  # Reduced for demo
 train_loader = torch.utils.data.DataLoader(
     train_dataset,
     batch_size=batch_size,
@@ -75,85 +93,41 @@ test_loader = torch.utils.data.DataLoader(
     shuffle=True
 )
 
-
-# added sections
-# %% Train - with proper normalization for VGG16
-# Prepare normalized datasets for training
-normalized_train_dataset = torchvision.datasets.ImageFolder(
-    root=TRAIN_ROOT,
-    transform=transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                            std=[0.229, 0.224, 0.225])
-    ])
-)
-
-normalized_test_dataset = torchvision.datasets.ImageFolder(
-    root=TEST_ROOT,
-    transform=transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                            std=[0.229, 0.224, 0.225])
-    ])
-)
-
-# Update loaders with normalized data
-normalized_train_loader = torch.utils.data.DataLoader(
-    normalized_train_dataset,
-    batch_size=batch_size,
-    shuffle=True
-)
-normalized_test_loader = torch.utils.data.DataLoader(
-    normalized_test_dataset,
-    batch_size=batch_size,
-    shuffle=True
-)
-
-
-
-
 # %% Train
 cross_entropy_loss = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.00001)
-epochs = 5 # Reduced for demonstration
+epochs = 3  # Reduced for demo
 
 print("Starting training...")
-for epoch in range(epochs):  
-    for i, batch in enumerate(normalized_train_loader, 0):
+for epoch in range(epochs):
+    for i, batch in enumerate(train_loader, 0):
+        if i > 10:  # Limit for demo
+            break
         inputs, labels = batch
         inputs = inputs.to(device)
         labels = labels.to(device)
         optimizer.zero_grad()
         outputs = model(inputs)
-        oss = cross_entropy_loss(outputs, labels) # added sections
         loss = cross_entropy_loss(outputs, labels)
         loss.backward()
         optimizer.step()
-        # added sectons
-        if i % 10 == 0:  # Print every 10 batches
+        if i % 5 == 0:
             print(f'Epoch {epoch+1}/{epochs}, Batch {i}, Loss: {loss.item():.4f}')
 
 print("Training completed.")
 
 # %% Inspect predictions for first batch
-import pandas as pd
 inputs, labels = next(iter(test_loader))
 inputs = inputs.to(device)
 labels = labels.numpy()
 outputs = model(inputs).max(1).indices.detach().cpu().numpy()
+print("Batch accuracy: ", (labels==outputs).sum()/len(labels))
 comparison = pd.DataFrame()
-# added sections
 comparison["labels"] = labels
 comparison["outputs"] = outputs
 print(comparison.head())
 
 # %% Layerwise relevance propagation for VGG16
-# For other CNN architectures this code might become more complex
-# Source: https://git.tu-berlin.de/gmontavon/lrp-tutorial
-# http://iphome.hhi.de/samek/pdf/MonXAI19.pdf
-
 def new_layer(layer, g):
     """Clone a layer and pass its parameters through the function g."""
     layer = copy.deepcopy(layer)
@@ -258,7 +232,7 @@ def apply_lrp_on_vgg16(model, image):
     # >>> Potential Step 5: Apply different propagation rule for pixels
     return relevances[0]
 
-# %% Grad-CAM Implementation - ADDED
+# %% Grad-CAM Implementation - FIXED
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model = model
@@ -291,6 +265,10 @@ class GradCAM:
         one_hot[0][class_idx] = 1.0
         output.backward(gradient=one_hot, retain_graph=True)
 
+        # Check if gradients exist
+        if self.gradients is None:
+            raise ValueError("Gradients are None. Make sure the target layer is correct and gradients are computed.")
+        
         # Get gradients and activations
         gradients = self.gradients  # [1, C, H, W]
         activations = self.activations  # [1, C, H, W]
@@ -307,7 +285,7 @@ class GradCAM:
         cam = cam / (cam.max() + 1e-8)
         return cam.squeeze().cpu().numpy()
 
-# %% Calculate relevances for first image in test batch - FIXED
+# %% Calculate relevances for first image in test batch
 image_id = 0  # Changed from 31 to 0 to avoid index errors
 image_tensor = inputs[image_id]
 
@@ -320,51 +298,129 @@ image_relevances = np.interp(image_relevances, (image_relevances.min(),
 
 # Apply Grad-CAM
 grad_cam = GradCAM(model, target_layer='features.29')  # Last conv layer in VGG16
-cam_map = grad_cam(image_tensor.unsqueeze(0), class_idx=outputs[image_id])
+try:
+    cam_map = grad_cam(image_tensor.unsqueeze(0), class_idx=outputs[image_id])
+    
+    # Prepare original image for visualization
+    # Denormalize for visualization
+    inv_normalize = transforms.Normalize(
+        mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
+        std=[1/0.229, 1/0.224, 1/0.225]
+    )
+    orig_img = inv_normalize(image_tensor.cpu()).permute(1, 2, 0).numpy()
+    orig_img = np.clip(orig_img, 0, 1)
+    
+    # Create Grad-CAM heatmap overlay
+    cam_heatmap = np.uint8(255 * cam_map)
+    cam_heatmap = cv2.applyColorMap(cv2.resize(cam_heatmap, (224, 224)), cv2.COLORMAP_JET)
+    cam_heatmap = cv2.cvtColor(cam_heatmap, cv2.COLOR_BGR2RGB)
+    overlay = cv2.addWeighted(np.uint8(orig_img * 255), 0.6, cam_heatmap, 0.4, 0)
+    
+    # Get class names
+    class_names = ['glioma', 'meningioma', 'notumor', 'pituitary']
+    pred_label = class_names[outputs[image_id]]
+    true_label = class_names[labels[image_id]]
+    
+    # Show results
+    if outputs[image_id] == labels[image_id]:
+        print(f"Correctly classified as: {pred_label} (Ground truth: {true_label})")
+    else:
+        print(f"Wrongly classified as: {pred_label} (Ground truth: {true_label})")
+    
+    # Plot images in a 2x2 grid for comparison
+    fig, axes = plt.subplots(2, 2, figsize=(10, 10))
+    
+    # Original Image
+    axes[0,0].imshow(orig_img)
+    axes[0,0].set_title(f"Original MRI\n(True: {true_label}, Pred: {pred_label})")
+    axes[0,0].axis('off')
+    
+    # LRP Heatmap
+    axes[0,1].imshow(image_relevances[:,:,0], cmap="seismic", vmin=0, vmax=1)
+    axes[0,1].set_title("LRP Heatmap")
+    axes[0,1].axis('off')
+    
+    # Grad-CAM Heatmap
+    axes[1,0].imshow(cam_map, cmap="jet", vmin=0, vmax=1)
+    axes[1,0].set_title("Grad-CAM Heatmap")
+    axes[1,0].axis('off')
+    
+    # Grad-CAM Overlay
+    axes[1,1].imshow(overlay)
+    axes[1,1].set_title("Grad-CAM Overlay")
+    axes[1,1].axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+    
+except Exception as e:
+    print(f"Error in Grad-CAM: {e}")
+    print("This might be due to the target layer not being found or other issues.")
+    print("Trying with a different target layer...")
+    
+    # Try with a different target layer
+    try:
+        grad_cam = GradCAM(model, target_layer='features.28')  # Alternative target layer
+        cam_map = grad_cam(image_tensor.unsqueeze(0), class_idx=outputs[image_id])
+        
+        # Prepare original image for visualization
+        inv_normalize = transforms.Normalize(
+            mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
+            std=[1/0.229, 1/0.224, 1/0.225]
+        )
+        orig_img = inv_normalize(image_tensor.cpu()).permute(1, 2, 0).numpy()
+        orig_img = np.clip(orig_img, 0, 1)
+        
+        # Create Grad-CAM heatmap overlay
+        cam_heatmap = np.uint8(255 * cam_map)
+        cam_heatmap = cv2.applyColorMap(cv2.resize(cam_heatmap, (224, 224)), cv2.COLORMAP_JET)
+        cam_heatmap = cv2.cvtColor(cam_heatmap, cv2.COLOR_BGR2RGB)
+        overlay = cv2.addWeighted(np.uint8(orig_img * 255), 0.6, cam_heatmap, 0.4, 0)
+        
+        # Get class names
+        class_names = ['glioma', 'meningioma', 'notumor', 'pituitary']
+        pred_label = class_names[outputs[image_id]]
+        true_label = class_names[labels[image_id]]
+        
+        # Show results
+        if outputs[image_id] == labels[image_id]:
+            print(f"Correctly classified as: {pred_label} (Ground truth: {true_label})")
+        else:
+            print(f"Wrongly classified as: {pred_label} (Ground truth: {true_label})")
+        
+        # Plot images in a 2x2 grid for comparison
+        fig, axes = plt.subplots(2, 2, figsize=(10, 10))
+        
+        # Original Image
+        axes[0,0].imshow(orig_img)
+        axes[0,0].set_title(f"Original MRI\n(True: {true_label}, Pred: {pred_label})")
+        axes[0,0].axis('off')
+        
+        # LRP Heatmap
+        axes[0,1].imshow(image_relevances[:,:,0], cmap="seismic", vmin=0, vmax=1)
+        axes[0,1].set_title("LRP Heatmap")
+        axes[0,1].axis('off')
+        
+        # Grad-CAM Heatmap
+        axes[1,0].imshow(cam_map, cmap="jet", vmin=0, vmax=1)
+        axes[1,0].set_title("Grad-CAM Heatmap")
+        axes[1,0].axis('off')
+        
+        # Grad-CAM Overlay
+        axes[1,1].imshow(overlay)
+        axes[1,1].set_title("Grad-CAM Overlay")
+        axes[1,1].axis('off')
+        
+        plt.tight_layout()
+        plt.show()
+    except Exception as e2:
+        print(f"Error with alternative target layer: {e2}")
+        print("LRP heatmap only:")
+        plt.figure(figsize=(5, 5))
+        plt.imshow(image_relevances[:,:,0], cmap="seismic", vmin=0, vmax=1)
+        plt.title("LRP Heatmap")
+        plt.axis('off')
+        plt.show()
 
-# Prepare original image for visualization
-orig_img = image_tensor.permute(1,2,0).detach().cpu().numpy()
 
-# Create Grad-CAM heatmap overlay
-cam_heatmap = np.uint8(255 * cam_map)
-cam_heatmap = cv2.applyColorMap(cv2.resize(cam_heatmap, (224, 224)), cv2.COLORMAP_JET)
-cam_heatmap = cv2.cvtColor(cam_heatmap, cv2.COLOR_BGR2RGB)
-overlay = cv2.addWeighted(np.uint8(orig_img * 255), 0.6, cam_heatmap, 0.4, 0)
-
-# Get class names
-class_names = ['glioma', 'meningioma', 'notumor', 'pituitary']
-pred_label = class_names[outputs[image_id]]
-true_label = class_names[labels[image_id]]
-
-# Show results
-if outputs[image_id] == labels[image_id]:
-    print(f"Correctly classified as: {pred_label} (Ground truth: {true_label})")
-else:
-    print(f"Wrongly classified as: {pred_label} (Ground truth: {true_label})")
-
-# Plot images in a 2x2 grid for comparison
-fig, axes = plt.subplots(2, 2, figsize=(10, 10))
-
-# Original Image
-axes[0,0].imshow(orig_img)
-axes[0,0].set_title(f"Original MRI\n(True: {true_label}, Pred: {pred_label})")
-axes[0,0].axis('off')
-
-# LRP Heatmap
-axes[0,1].imshow(image_relevances[:,:,0], cmap="seismic", vmin=0, vmax=1)
-axes[0,1].set_title("LRP Heatmap")
-axes[0,1].axis('off')
-
-# Grad-CAM Heatmap
-axes[1,0].imshow(cam_map, cmap="jet", vmin=0, vmax=1)
-axes[1,0].set_title("Grad-CAM Heatmap")
-axes[1,0].axis('off')
-
-# Grad-CAM Overlay
-axes[1,1].imshow(overlay)
-axes[1,1].set_title("Grad-CAM Overlay")
-axes[1,1].axis('off')
-
-plt.tight_layout()
-plt.show()
 
