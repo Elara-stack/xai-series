@@ -1,6 +1,3 @@
-# %% Install required packages
-!pip install opencv-python
-
 # %% Imports
 import torch
 import torch.nn as nn
@@ -421,6 +418,3 @@ except Exception as e:
         plt.title("LRP Heatmap")
         plt.axis('off')
         plt.show()
-
-
-
