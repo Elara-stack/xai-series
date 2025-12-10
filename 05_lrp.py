@@ -1,4 +1,3 @@
-%%writefile 05_lrp.py
 # %% Imports
 import torch
 import torch.nn as nn
@@ -99,7 +98,7 @@ print("Batch accuracy:", (labels_np == preds).mean())
 comparison = pd.DataFrame({"labels": labels_np, "outputs": preds})
 print(comparison.head())
 
-# %% Grad-CAM Class (fixed hook name usage)
+# %% Grad-CAM Class (fully fixed with clone().detach())
 class GradCAM:
     def __init__(self, model, target_layer_name):
         self.model = model
@@ -110,9 +109,10 @@ class GradCAM:
 
     def _register_hooks(self):
         def forward_hook(module, input, output):
-            self.activations = output.detach()
+            self.activations = output.clone().detach()  # ✅ clone to avoid view issues
+
         def backward_hook(module, grad_in, grad_out):
-            self.gradients = grad_out[0].detach()
+            self.gradients = grad_out[0].clone().detach()  # ✅ clone to avoid view issues
 
         found = False
         for name, module in self.model.named_modules():
@@ -123,7 +123,7 @@ class GradCAM:
                 break
         if not found:
             raise ValueError(f"Layer '{self.target_layer_name}' not found in model. "
-                             f"Available layers with 'features.28': {[n for n, _ in self.model.named_modules() if 'features.28' in n]}")
+                             f"Available layers containing 'features.28': {[n for n, _ in self.model.named_modules() if 'features.28' in n]}")
 
     def __call__(self, input_tensor, class_idx=None):
         self.model.zero_grad()
@@ -134,8 +134,8 @@ class GradCAM:
         one_hot[0][class_idx] = 1.0
         output.backward(gradient=one_hot, retain_graph=True)
 
-        if self.gradients is None:
-            raise RuntimeError("Gradients not captured. Hook may not have fired.")
+        if self.gradients is None or self.activations is None:
+            raise RuntimeError("Gradients or activations not captured. Hook may not have fired.")
 
         weights = torch.mean(self.gradients, dim=[2, 3], keepdim=True)
         cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
@@ -241,7 +241,6 @@ lrp_heatmap = np.interp(lrp_heatmap, (lrp_heatmap.min(), lrp_heatmap.max()), (0,
 
 # --- Grad-CAM (FIXED) ---
 try:
-    # ✅ CORRECT LAYER NAME: 'vgg16.features.28'
     grad_cam = GradCAM(model, target_layer_name='vgg16.features.28')
     cam_map = grad_cam(image_tensor.unsqueeze(0), class_idx=preds[image_id])
 except Exception as e:
