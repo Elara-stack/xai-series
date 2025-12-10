@@ -15,7 +15,7 @@ from PIL import Image
 print("CUDA available:", torch.cuda.is_available())
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# %% Demo Dataset (returns PIL Image)
+# %% Demo Dataset
 class DemoDataset(torch.utils.data.Dataset):
     def __init__(self, num_samples=100, transform=None):
         self.num_samples = num_samples
@@ -25,10 +25,9 @@ class DemoDataset(torch.utils.data.Dataset):
         return self.num_samples
     
     def __getitem__(self, idx):
-        # Random RGB image as uint8 (HWC)
         image_np = np.random.randint(0, 256, (224, 224, 3), dtype=np.uint8)
         image_pil = Image.fromarray(image_np)
-        label = np.random.randint(0, 4)  # 4 classes
+        label = np.random.randint(0, 4)
         if self.transform:
             image_pil = self.transform(image_pil)
         return image_pil, label
@@ -40,7 +39,7 @@ train_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-test_transform = train_transform  # same for demo
+test_transform = train_transform
 
 # %% Datasets & Loaders
 train_dataset = DemoDataset(num_samples=200, transform=train_transform)
@@ -72,7 +71,7 @@ print("Starting training...")
 model.train()
 for epoch in range(epochs):
     for i, (inputs, labels) in enumerate(train_loader):
-        if i > 10:  # limit for speed
+        if i > 10:
             break
         inputs, labels = inputs.to(device), labels.to(device)
         optimizer.zero_grad()
@@ -85,7 +84,7 @@ for epoch in range(epochs):
 
 print("Training completed.")
 
-# %% Evaluation on one test batch
+# %% Evaluation
 model.eval()
 inputs, labels = next(iter(test_loader))
 inputs = inputs.to(device)
@@ -98,7 +97,7 @@ print("Batch accuracy:", (labels_np == preds).mean())
 comparison = pd.DataFrame({"labels": labels_np, "outputs": preds})
 print(comparison.head())
 
-# %% Grad-CAM Class (fully fixed with clone().detach())
+# %% Grad-CAM (FINAL FIXED VERSION - avoid MaxPool2d)
 class GradCAM:
     def __init__(self, model, target_layer_name):
         self.model = model
@@ -109,10 +108,12 @@ class GradCAM:
 
     def _register_hooks(self):
         def forward_hook(module, input, output):
-            self.activations = output.clone().detach()  # ✅ clone to avoid view issues
+            # Use clone to avoid view issues
+            self.activations = output.clone().detach()
 
         def backward_hook(module, grad_in, grad_out):
-            self.gradients = grad_out[0].clone().detach()  # ✅ clone to avoid view issues
+            # Clone before detach to prevent inplace modification
+            self.gradients = grad_out[0].clone().detach()
 
         found = False
         for name, module in self.model.named_modules():
@@ -122,8 +123,7 @@ class GradCAM:
                 found = True
                 break
         if not found:
-            raise ValueError(f"Layer '{self.target_layer_name}' not found in model. "
-                             f"Available layers containing 'features.28': {[n for n, _ in self.model.named_modules() if 'features.28' in n]}")
+            raise ValueError(f"Layer '{self.target_layer_name}' not found in model.")
 
     def __call__(self, input_tensor, class_idx=None):
         self.model.zero_grad()
@@ -135,7 +135,7 @@ class GradCAM:
         output.backward(gradient=one_hot, retain_graph=True)
 
         if self.gradients is None or self.activations is None:
-            raise RuntimeError("Gradients or activations not captured. Hook may not have fired.")
+            raise RuntimeError("Gradients or activations not captured.")
 
         weights = torch.mean(self.gradients, dim=[2, 3], keepdim=True)
         cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
@@ -144,83 +144,57 @@ class GradCAM:
         cam = cam / (cam.max() + 1e-8)
         return cam.squeeze().cpu().numpy()
 
-# %% LRP Helper Functions (unchanged)
-def new_layer(layer, g):
-    layer = copy.deepcopy(layer)
-    try: layer.weight = torch.nn.Parameter(g(layer.weight))
-    except AttributeError: pass
-    try: layer.bias = torch.nn.Parameter(g(layer.bias))
-    except AttributeError: pass
-    return layer
-
-def dense_to_conv(layers):
-    newlayers = []
-    for i, layer in enumerate(layers):
-        if isinstance(layer, nn.Linear):
-            if i == 0:
-                m, n = 512, layer.weight.shape[0]
-                newlayer = nn.Conv2d(m, n, 7)
-                newlayer.weight = nn.Parameter(layer.weight.reshape(n, m, 7, 7))
-            else:
-                m, n = layer.weight.shape[1], layer.weight.shape[0]
-                newlayer = nn.Conv2d(m, n, 1)
-                newlayer.weight = nn.Parameter(layer.weight.reshape(n, m, 1, 1))
-            newlayer.bias = nn.Parameter(layer.bias)
-            newlayers.append(newlayer)
-        else:
-            newlayers.append(layer)
-    return newlayers
-
-def get_linear_layer_indices(model):
-    offset = len(model.vgg16.features) + 1
-    indices = []
-    for i, layer in enumerate(model.vgg16.classifier):
-        if isinstance(layer, nn.Linear):
-            indices.append(i)
-    return [offset + i for i in indices]
-
+# %% Simplified LRP (avoid MaxPool view issues)
 def apply_lrp_on_vgg16(model, image):
     image = image.unsqueeze(0)
-    layers = list(model.vgg16.features) + [model.vgg16.avgpool] + dense_to_conv(list(model.vgg16.classifier))
-    linear_layer_indices = get_linear_layer_indices(model)
-    n_layers = len(layers)
-    activations = [image] + [None] * n_layers
+    layers = list(model.vgg16.features) + [model.vgg16.avgpool]
+    
+    # Replace MaxPool2d with AvgPool2d
+    for i, layer in enumerate(layers):
+        if isinstance(layer, nn.MaxPool2d):
+            layers[i] = nn.AvgPool2d(kernel_size=2, stride=2)
 
-    for idx in range(n_layers):
-        if idx in linear_layer_indices and idx == len(model.vgg16.features) + 1:
-            activations[idx] = activations[idx].reshape(1, 512, 7, 7)
-        out = layers[idx](activations[idx])
-        if isinstance(layers[idx], torch.nn.AdaptiveAvgPool2d):
-            out = torch.flatten(out, start_dim=1)
-        activations[idx + 1] = out
+    classifier_layers = []
+    for layer in model.vgg16.classifier:
+        if isinstance(layer, nn.Linear):
+            if len(classifier_layers) == 0:
+                m, n = 512, layer.weight.shape[0]
+                newlayer = nn.Conv2d(m, n, kernel_size=7)
+                newlayer.weight = nn.Parameter(layer.weight.reshape(n, m, 7, 7))
+                newlayer.bias = nn.Parameter(layer.bias)
+            else:
+                m, n = layer.weight.shape[1], layer.weight.shape[0]
+                newlayer = nn.Conv2d(m, n, kernel_size=1)
+                newlayer.weight = nn.Parameter(layer.weight.reshape(n, m, 1, 1))
+                newlayer.bias = nn.Parameter(layer.bias)
+            classifier_layers.append(newlayer)
+        else:
+            classifier_layers.append(layer)
 
+    layers.extend(classifier_layers)
+    layers.append(nn.Flatten())
+
+    # Forward
+    activations = [image]
+    for layer in layers:
+        out = layer(activations[-1])
+        activations.append(out)
+
+    # One-hot
     output_act = activations[-1].detach().cpu().numpy()
     max_val = output_act.max()
     one_hot = np.where(output_act == max_val, max_val, 0.0)
     activations[-1] = torch.FloatTensor(one_hot).to(device)
 
-    relevances = [None] * n_layers + [activations[-1]]
-
-    for idx in reversed(range(n_layers)):
+    # Backward relevance
+    relevances = [None] * len(activations)
+    relevances[-1] = activations[-1]
+    for idx in reversed(range(len(activations) - 1)):
         current = layers[idx]
-        if isinstance(current, torch.nn.MaxPool2d):
-            layers[idx] = torch.nn.AvgPool2d(2)
-            current = layers[idx]
+        act = activations[idx].data.requires_grad_(True)
 
-        if isinstance(current, (torch.nn.Conv2d, torch.nn.AvgPool2d, torch.nn.Linear)):
-            act = activations[idx].data.requires_grad_(True)
-
-            if idx <= 16:
-                rho = lambda p: p + 0.25 * p.clamp(min=0)
-                incr = lambda z: z + 1e-9
-            elif 17 <= idx <= 30:
-                rho = lambda p: p
-                incr = lambda z: z + 1e-9 + 0.25 * ((z ** 2).mean() ** 0.5).data
-            else:
-                rho = lambda p: p
-                incr = lambda z: z + 1e-9
-
-            z = incr(new_layer(current, rho)(act))
+        if isinstance(current, (nn.Conv2d, nn.AvgPool2d)):
+            z = current(act) + 1e-9
             s = (relevances[idx + 1] / z).data
             (z * s).sum().backward()
             c = act.grad
@@ -234,12 +208,12 @@ def apply_lrp_on_vgg16(model, image):
 image_id = 0
 image_tensor = inputs[image_id]
 
-# --- LRP ---
+# LRP
 lrp_result = apply_lrp_on_vgg16(model, image_tensor)
 lrp_heatmap = lrp_result.permute(0, 2, 3, 1).cpu().numpy()[0]
 lrp_heatmap = np.interp(lrp_heatmap, (lrp_heatmap.min(), lrp_heatmap.max()), (0, 1))
 
-# --- Grad-CAM (FIXED) ---
+# Grad-CAM
 try:
     grad_cam = GradCAM(model, target_layer_name='vgg16.features.28')
     cam_map = grad_cam(image_tensor.unsqueeze(0), class_idx=preds[image_id])
@@ -247,7 +221,7 @@ except Exception as e:
     print("❌ Grad-CAM failed:", e)
     cam_map = np.zeros((224, 224))
 
-# --- Denormalize image ---
+# Denormalize
 inv_normalize = transforms.Normalize(
     mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
     std=[1/0.229, 1/0.224, 1/0.225]
@@ -255,7 +229,7 @@ inv_normalize = transforms.Normalize(
 orig_img = inv_normalize(image_tensor.cpu()).permute(1, 2, 0).numpy()
 orig_img = np.clip(orig_img, 0, 1)
 
-# --- Overlay for Grad-CAM ---
+# Overlay
 if cam_map.any():
     cam_resized = cv2.resize(cam_map, (224, 224))
     cam_heatmap_vis = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
@@ -264,7 +238,7 @@ if cam_map.any():
 else:
     overlay = np.uint8(orig_img * 255)
 
-# --- Plot ---
+# Plot
 class_names = ['glioma', 'meningioma', 'notumor', 'pituitary']
 true_label = class_names[labels_np[image_id]]
 pred_label = class_names[preds[image_id]]
