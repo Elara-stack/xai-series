@@ -8,26 +8,41 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import pandas as pd
 import cv2
+import os
+from torch.utils.data import Dataset, DataLoader
 
 print("CUDA available:", torch.cuda.is_available())
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# %% Demo Dataset (Random images for demo)
-class DemoDataset(torch.utils.data.Dataset):
-    def __init__(self, num_samples=100, transform=None):
-        self.num_samples = num_samples
+# %% Real Brain MRI Dataset (Match Your Folder Names)
+class BrainMRIDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
         self.transform = transform
+        # ✅ Use exact folder names from your data
+        self.classes = ['glioma_tumor', 'meningioma_tumor', 'no_tumor', 'pituitary_tumor']
+        self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(self.classes)}
+        self.samples = []
+
+        for class_name in self.classes:
+            class_dir = os.path.join(root_dir, class_name)
+            if not os.path.isdir(class_dir):
+                continue
+            for img_name in os.listdir(class_dir):
+                if img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    self.samples.append((os.path.join(class_dir, img_name), self.class_to_idx[class_name]))
+
+        print(f"✅ Loaded {len(self.samples)} images from {root_dir}")
 
     def __len__(self):
-        return self.num_samples
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        image_np = np.random.randint(0, 256, (224, 224, 3), dtype=np.uint8)
-        image_pil = Image.fromarray(image_np)
-        label = np.random.randint(0, 4)
+        img_path, label = self.samples[idx]
+        image = Image.open(img_path).convert('RGB')
         if self.transform:
-            image_pil = self.transform(image_pil)
-        return image_pil, label
+            image = self.transform(image)
+        return image, label
 
 # %% Transforms
 train_transform = transforms.Compose([
@@ -36,13 +51,22 @@ train_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# %% Datasets & Loaders
-train_dataset = DemoDataset(num_samples=200, transform=train_transform)
-test_dataset = DemoDataset(num_samples=50, transform=train_transform)
+# %% Load dataset with correct paths
+DATA_ROOT_TRAIN = "data/brain_mri/training"
+DATA_ROOT_TEST = "data/brain_mri/testing"
+
+if not os.path.exists(DATA_ROOT_TRAIN):
+    raise FileNotFoundError(f"Training directory not found: {DATA_ROOT_TRAIN}")
+if not os.path.exists(DATA_ROOT_TEST):
+    raise FileNotFoundError(f"Testing directory not found: {DATA_ROOT_TEST}")
+
+# Load full datasets
+train_dataset = BrainMRIDataset(DATA_ROOT_TRAIN, transform=train_transform)
+test_dataset = BrainMRIDataset(DATA_ROOT_TEST, transform=train_transform)
 
 batch_size = 16
-train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 # %% Model: VGG16 with 4 classes
 class CNNModel(nn.Module):
@@ -71,22 +95,22 @@ print("✅ All MaxPool2d replaced with AvgPool2d")
 # %% Training
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
-epochs = 3
+epochs = 5
 
-print("Starting training...")
+print("Starting training on real brain MRI data...")
 model.train()
 for epoch in range(epochs):
+    total_loss = 0
     for i, (inputs, labels) in enumerate(train_loader):
-        if i > 10:
-            break
         inputs, labels = inputs.to(device), labels.to(device)
         optimizer.zero_grad()
         outputs = model(inputs)
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
-        if i % 5 == 0:
-            print(f'Epoch {epoch+1}/{epochs}, Batch {i}, Loss: {loss.item():.4f}')
+        total_loss += loss.item()
+    avg_loss = total_loss / len(train_loader)
+    print(f'Epoch {epoch+1}/{epochs}, Avg Loss: {avg_loss:.4f}')
 
 print("Training completed.")
 
@@ -103,7 +127,7 @@ print("Batch accuracy:", (labels_np == preds).mean())
 comparison = pd.DataFrame({"labels": labels_np, "outputs": preds})
 print(comparison.head())
 
-# %% Grad-CAM: SAFE VERSION using torch.autograd.grad (no backward hooks!)
+# %% Grad-CAM: SAFE VERSION
 class GradCAM:
     def __init__(self, model, target_layer_name):
         self.model = model
@@ -124,7 +148,7 @@ class GradCAM:
         if not found:
             available_convs = [name for name, m in self.model.named_modules() if isinstance(m, nn.Conv2d)]
             raise ValueError(
-                f"Layer '{self.target_layer_name}' not found or not a Conv2d.\n"
+                f"Layer '{self.target_layer_name}' not found.\n"
                 f"Available Conv2d layers:\n" + "\n".join(available_convs[:10]) + "..."
             )
 
@@ -138,10 +162,7 @@ class GradCAM:
             one_hot[0][class_idx] = 1.0
 
             params = list(self.model.parameters())
-            try:
-                grads = torch.autograd.grad(outputs, params, grad_outputs=one_hot, retain_graph=True, allow_unused=True)
-            except Exception as e:
-                raise RuntimeError(f"Grad computation failed: {e}")
+            grads = torch.autograd.grad(outputs, params, grad_outputs=one_hot, retain_graph=True, allow_unused=True)
 
             target_grad = None
             for (name, param), grad in zip(self.model.named_parameters(), grads):
@@ -159,7 +180,7 @@ class GradCAM:
             cam = cam / (cam.max() + 1e-8)
             return cam.squeeze().cpu().numpy()
 
-# %% LRP (safe after MaxPool → AvgPool)
+# %% LRP (same as before)
 def apply_lrp_on_vgg16(model, image):
     image = image.unsqueeze(0)
     layers = list(model.vgg16.features) + [model.vgg16.avgpool]
@@ -183,20 +204,17 @@ def apply_lrp_on_vgg16(model, image):
 
     full_layers = layers + classifier_layers + [nn.Flatten()]
 
-    # Forward pass
     activations = [image]
     for layer in full_layers:
         out = layer(activations[-1])
         activations.append(out)
 
-    # One-hot relevance
     output_act = activations[-1].detach().cpu().numpy()
     max_val = output_act.max()
     one_hot = np.where(output_act == max_val, max_val, 0.0)
     relevances = [None] * len(activations)
     relevances[-1] = torch.FloatTensor(one_hot).to(device)
 
-    # Backward relevance propagation
     for idx in reversed(range(len(full_layers))):
         current = full_layers[idx]
         act = activations[idx].data.requires_grad_(True)
@@ -222,9 +240,9 @@ lrp_heatmap = lrp_result.permute(0, 2, 3, 1).cpu().numpy()[0]
 lrp_heatmap = np.interp(lrp_heatmap, (lrp_heatmap.min(), lrp_heatmap.max()), (0, 1))
 
 # --- Grad-CAM ---
-cam_map = np.zeros((224, 224))  # default fallback
+cam_map = np.zeros((224, 224))
 try:
-    grad_cam = GradCAM(model, target_layer_name='vgg16.features.28')
+    grad_cam = GradCAM(model, target_layer_name='vgg16.features.24')  # 👈 更早的层
     raw_cam = grad_cam(image_tensor.unsqueeze(0), class_idx=preds[image_id])
     if raw_cam is not None and raw_cam.size > 0:
         cam_map = raw_cam
@@ -256,7 +274,7 @@ else:
     cam_map = np.zeros((224, 224))
 
 # Plot
-class_names = ['glioma', 'meningioma', 'notumor', 'pituitary']
+class_names = ['glioma_tumor', 'meningioma_tumor', 'no_tumor', 'pituitary_tumor']
 true_label = class_names[labels_np[image_id]]
 pred_label = class_names[preds[image_id]]
 
@@ -279,7 +297,7 @@ axes[1, 1].set_title("Grad-CAM Overlay")
 axes[1, 1].axis('off')
 
 plt.tight_layout()
-plt.savefig("xai_comparison.png", dpi=150, bbox_inches='tight')
+plt.savefig("xai_comparison_real.png", dpi=150, bbox_inches='tight')
 plt.show()
 
-print("✅ Visualization saved as 'xai_comparison.png'")
+print("✅ Visualization saved as 'xai_comparison_real.png'")
