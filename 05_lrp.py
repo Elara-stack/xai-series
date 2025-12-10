@@ -14,17 +14,10 @@ from PIL import Image
 import torch.nn.functional as F
 
 # Set GPU device
-print(torch.cuda.is_available())
+print("CUDA available:", torch.cuda.is_available())
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# %% Load data - Use a sample dataset or create synthetic data for demo
-# Since you don't have the actual data, we'll create a simple dataset
-# You can replace this with your actual data later
-
-# For demo purposes, let's use a small subset of a public dataset
-# Or create synthetic data to test the code
-
-# Create a simple dataset class for demo
+# %% Demo Dataset (fixed to return PIL Image)
 class DemoDataset(torch.utils.data.Dataset):
     def __init__(self, num_samples=100, transform=None):
         self.num_samples = num_samples
@@ -34,14 +27,15 @@ class DemoDataset(torch.utils.data.Dataset):
         return self.num_samples
     
     def __getitem__(self, idx):
-        # Create random image (simulating MRI data)
-        image = torch.randn(3, 224, 224)  # Random image
-        label = torch.randint(0, 4, (1,)).item()  # Random label (0-3)
+        # Generate random RGB image as uint8 NumPy array (HWC)
+        image_np = np.random.randint(0, 256, (224, 224, 3), dtype=np.uint8)
+        image_pil = Image.fromarray(image_np)
+        label = np.random.randint(0, 4)  # 4 classes: 0,1,2,3
         if self.transform:
-            image = self.transform(image)
-        return image, label
+            image_pil = self.transform(image_pil)
+        return image_pil, label
 
-# %% Create demo datasets
+# %% Transforms
 train_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
@@ -56,56 +50,44 @@ test_transform = transforms.Compose([
                         std=[0.229, 0.224, 0.225])
 ])
 
-# Create demo datasets
+# %% Create demo datasets
 train_dataset = DemoDataset(num_samples=200, transform=train_transform)
 test_dataset = DemoDataset(num_samples=50, transform=test_transform)
 
-# %% Building the model
+# %% Build model
 class CNNModel(nn.Module):
     def __init__(self):
         super(CNNModel, self).__init__()
-        self.vgg16 = models.vgg16(weights='VGG16_Weights.DEFAULT')  # Updated for newer PyTorch
-
-        # Replace output layer according to our problem
+        # Use newer PyTorch weights API
+        self.vgg16 = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
         in_feats = self.vgg16.classifier[6].in_features 
         self.vgg16.classifier[6] = nn.Linear(in_feats, 4)
 
     def forward(self, x):
-        x = self.vgg16(x)
-        return x
+        return self.vgg16(x)
 
-model = CNNModel()
-model.to(device)
+model = CNNModel().to(device)
 
-# %% Create data loaders
-batch_size = 16  # Reduced for demo
-train_loader = torch.utils.data.DataLoader(
-    train_dataset,
-    batch_size=batch_size,
-    shuffle=True
-)
-test_loader = torch.utils.data.DataLoader(
-    test_dataset,
-    batch_size=batch_size,
-    shuffle=True
-)
+# %% Data Loaders
+batch_size = 16
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-# %% Train
-cross_entropy_loss = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=0.00001)
-epochs = 3  # Reduced for demo
+# %% Training
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-5)
+epochs = 3
 
 print("Starting training...")
+model.train()
 for epoch in range(epochs):
-    for i, batch in enumerate(train_loader, 0):
-        if i > 10:  # Limit for demo
+    for i, (inputs, labels) in enumerate(train_loader):
+        if i > 10:  # Limit for demo speed
             break
-        inputs, labels = batch
-        inputs = inputs.to(device)
-        labels = labels.to(device)
+        inputs, labels = inputs.to(device), labels.to(device)
         optimizer.zero_grad()
         outputs = model(inputs)
-        loss = cross_entropy_loss(outputs, labels)
+        loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
         if i % 5 == 0:
@@ -113,20 +95,21 @@ for epoch in range(epochs):
 
 print("Training completed.")
 
-# %% Inspect predictions for first batch
+# %% Evaluation on one test batch
+model.eval()
 inputs, labels = next(iter(test_loader))
 inputs = inputs.to(device)
-labels = labels.numpy()
-outputs = model(inputs).max(1).indices.detach().cpu().numpy()
-print("Batch accuracy: ", (labels==outputs).sum()/len(labels))
-comparison = pd.DataFrame()
-comparison["labels"] = labels
-comparison["outputs"] = outputs
+labels_np = labels.numpy()
+with torch.no_grad():
+    outputs = model(inputs)
+preds = outputs.max(1).indices.cpu().numpy()
+
+print("Batch accuracy:", (labels_np == preds).mean())
+comparison = pd.DataFrame({"labels": labels_np, "outputs": preds})
 print(comparison.head())
 
-# %% Layerwise relevance propagation for VGG16
+# %% LRP Helper Functions
 def new_layer(layer, g):
-    """Clone a layer and pass its parameters through the function g."""
     layer = copy.deepcopy(layer)
     try: layer.weight = torch.nn.Parameter(g(layer.weight))
     except AttributeError: pass
@@ -135,286 +118,187 @@ def new_layer(layer, g):
     return layer
 
 def dense_to_conv(layers):
-    """ Converts a dense layer to a conv layer """
     newlayers = []
-    for i,layer in enumerate(layers):
+    for i, layer in enumerate(layers):
         if isinstance(layer, nn.Linear):
-            newlayer = None
             if i == 0:
                 m, n = 512, layer.weight.shape[0]
-                newlayer = nn.Conv2d(m,n,7)
-                newlayer.weight = nn.Parameter(layer.weight.reshape(n,m,7,7))
+                newlayer = nn.Conv2d(m, n, 7)
+                newlayer.weight = nn.Parameter(layer.weight.reshape(n, m, 7, 7))
             else:
-                m,n = layer.weight.shape[1],layer.weight.shape[0]
-                newlayer = nn.Conv2d(m,n,1)
-                newlayer.weight = nn.Parameter(layer.weight.reshape(n,m,1,1))
+                m, n = layer.weight.shape[1], layer.weight.shape[0]
+                newlayer = nn.Conv2d(m, n, 1)
+                newlayer.weight = nn.Parameter(layer.weight.reshape(n, m, 1, 1))
             newlayer.bias = nn.Parameter(layer.bias)
-            newlayers += [newlayer]
+            newlayers.append(newlayer)
         else:
-            newlayers += [layer]
+            newlayers.append(layer)
     return newlayers
 
 def get_linear_layer_indices(model):
-    offset = len(model.vgg16._modules['features']) + 1
+    offset = len(model.vgg16.features) + 1
     indices = []
-    for i, layer in enumerate(model.vgg16._modules['classifier']): 
-        if isinstance(layer, nn.Linear): 
+    for i, layer in enumerate(model.vgg16.classifier):
+        if isinstance(layer, nn.Linear):
             indices.append(i)
-    indices = [offset + val for val in indices]
-    return indices
+    return [offset + i for i in indices]
 
 def apply_lrp_on_vgg16(model, image):
-    image = torch.unsqueeze(image, 0)
-    # >>> Step 1: Extract layers
-    layers = list(model.vgg16._modules['features']) \
-                + [model.vgg16._modules['avgpool']] \
-                + dense_to_conv(list(model.vgg16._modules['classifier']))
+    image = image.unsqueeze(0)
+    layers = list(model.vgg16.features) + [model.vgg16.avgpool] + dense_to_conv(list(model.vgg16.classifier))
     linear_layer_indices = get_linear_layer_indices(model)
-    # >>> Step 2: Propagate image through layers and store activations
     n_layers = len(layers)
-    activations = [image] + [None] * n_layers # list of activations
-    
-    for layer in range(n_layers):
-        if layer in linear_layer_indices:
-            if layer == 32:
-                activations[layer] = activations[layer].reshape((1, 512, 7, 7))
-        activation = layers[layer].forward(activations[layer])
-        if isinstance(layers[layer], torch.nn.modules.pooling.AdaptiveAvgPool2d):
-            activation = torch.flatten(activation, start_dim=1)
-        activations[layer+1] = activation
+    activations = [image] + [None] * n_layers
 
-    # >>> Step 3: Replace last layer with one-hot-encoding
-    output_activation = activations[-1].detach().cpu().numpy()
-    max_activation = output_activation.max()
-    one_hot_output = [val if val == max_activation else 0 
-                        for val in output_activation[0]]
+    for idx in range(n_layers):
+        if idx in linear_layer_indices and idx == len(model.vgg16.features) + 1:
+            activations[idx] = activations[idx].reshape(1, 512, 7, 7)
+        out = layers[idx](activations[idx])
+        if isinstance(layers[idx], torch.nn.AdaptiveAvgPool2d):
+            out = torch.flatten(out, start_dim=1)
+        activations[idx + 1] = out
 
-    activations[-1] = torch.FloatTensor([one_hot_output]).to(device)
+    # One-hot max output
+    output_act = activations[-1].detach().cpu().numpy()
+    max_val = output_act.max()
+    one_hot = np.where(output_act == max_val, max_val, 0.0)
+    activations[-1] = torch.FloatTensor(one_hot).to(device)
 
-    # >>> Step 4: Backpropagate relevance scores
     relevances = [None] * n_layers + [activations[-1]]
-    # Iterate over the layers in reverse order
-    for layer in range(0, n_layers)[::-1]:
-        current = layers[layer]
-        # Treat max pooling layers as avg pooling
-        if isinstance(current, torch.nn.MaxPool2d):
-            layers[layer] = torch.nn.AvgPool2d(2)
-            current = layers[layer]
-        if isinstance(current, torch.nn.Conv2d) or \
-           isinstance(current, torch.nn.AvgPool2d) or\
-           isinstance(current, torch.nn.Linear):
-            activations[layer] = activations[layer].data.requires_grad_(True)
-            
-            # Apply variants of LRP depending on the depth
-            # see: https://link.springer.com/chapter/10.1007%2F978-3-030-28954-6_10
-            # Lower layers, LRP-gamma >> Favor positive contributions (activations)
-            if layer <= 16:       rho = lambda p: p + 0.25*p.clamp(min=0); incr = lambda z: z+1e-9
-            # Middle layers, LRP-epsilon >> Remove some noise / Only most salient factors survive
-            if 17 <= layer <= 30: rho = lambda p: p;                       incr = lambda z: z+1e-9+0.25*((z**2).mean()**.5).data
-            # Upper Layers, LRP-0 >> Basic rule
-            if layer >= 31:       rho = lambda p: p;                       incr = lambda z: z+1e-9
-            
-            # Transform weights of layer and execute forward pass
-            z = incr(new_layer(layers[layer],rho).forward(activations[layer]))
-            # Element-wise division between relevance of the next layer and z
-            s = (relevances[layer+1]/z).data                                     
-            # Calculate the gradient and multiply it by the activation
-            (z * s).sum().backward(); 
-            c = activations[layer].grad       
-            # Assign new relevance values           
-            relevances[layer] = (activations[layer]*c).data                          
-        else:
-            relevances[layer] = relevances[layer+1]
 
-    # >>> Potential Step 5: Apply different propagation rule for pixels
+    for idx in reversed(range(n_layers)):
+        current = layers[idx]
+        if isinstance(current, torch.nn.MaxPool2d):
+            layers[idx] = torch.nn.AvgPool2d(2)
+            current = layers[idx]
+
+        if isinstance(current, (torch.nn.Conv2d, torch.nn.AvgPool2d, torch.nn.Linear)):
+            act = activations[idx].data.requires_grad_(True)
+
+            if idx <= 16:
+                rho = lambda p: p + 0.25 * p.clamp(min=0)
+                incr = lambda z: z + 1e-9
+            elif 17 <= idx <= 30:
+                rho = lambda p: p
+                incr = lambda z: z + 1e-9 + 0.25 * ((z ** 2).mean() ** 0.5).data
+            else:
+                rho = lambda p: p
+                incr = lambda z: z + 1e-9
+
+            z = incr(new_layer(current, rho)(act))
+            s = (relevances[idx + 1] / z).data
+            (z * s).sum().backward()
+            c = act.grad
+            relevances[idx] = (act * c).data
+        else:
+            relevances[idx] = relevances[idx + 1]
+
     return relevances[0]
 
-# %% Grad-CAM Implementation - FIXED
+# %% Grad-CAM
 class GradCAM:
-    def __init__(self, model, target_layer):
+    def __init__(self, model, target_layer_name):
         self.model = model
-        self.target_layer = target_layer
+        self.target_layer_name = target_layer_name
         self.gradients = None
         self.activations = None
-        self.hook_layers()
+        self._register_hooks()
 
-    def hook_layers(self):
+    def _register_hooks(self):
         def forward_hook(module, input, output):
             self.activations = output.detach()
-
         def backward_hook(module, grad_in, grad_out):
             self.gradients = grad_out[0].detach()
 
-        # Register hooks
         for name, module in self.model.named_modules():
-            if name == self.target_layer:
+            if name == self.target_layer_name:
                 module.register_forward_hook(forward_hook)
                 module.register_full_backward_hook(backward_hook)
 
     def __call__(self, input_tensor, class_idx=None):
         self.model.zero_grad()
         output = self.model(input_tensor)
-        
         if class_idx is None:
             class_idx = output.argmax(dim=1).item()
-        
         one_hot = torch.zeros_like(output)
         one_hot[0][class_idx] = 1.0
         output.backward(gradient=one_hot, retain_graph=True)
 
-        # Check if gradients exist
         if self.gradients is None:
-            raise ValueError("Gradients are None. Make sure the target layer is correct and gradients are computed.")
-        
-        # Get gradients and activations
-        gradients = self.gradients  # [1, C, H, W]
-        activations = self.activations  # [1, C, H, W]
+            raise RuntimeError("Gradients not captured. Check target_layer_name.")
 
-        # Global average pooling of gradients to get weights
-        weights = torch.mean(gradients, dim=[2, 3], keepdim=True)  # [1, C, 1, 1]
-        
-        # Weighted sum of activations
-        cam = torch.sum(weights * activations, dim=1, keepdim=True)  # [1, 1, H, W]
-        cam = torch.relu(cam)  # Only positive contributions
-
-        # Normalize to [0, 1]
+        weights = torch.mean(self.gradients, dim=[2, 3], keepdim=True)
+        cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
+        cam = torch.relu(cam)
         cam = cam - cam.min()
         cam = cam / (cam.max() + 1e-8)
         return cam.squeeze().cpu().numpy()
 
-# %% Calculate relevances for first image in test batch
-image_id = 0  # Changed from 31 to 0 to avoid index errors
+# %% Visualization
+image_id = 0
 image_tensor = inputs[image_id]
 
-# Apply LRP
-image_relevances = apply_lrp_on_vgg16(model, image_tensor)
-image_relevances = image_relevances.permute(0,2,3,1).detach().cpu().numpy()[0]
-image_relevances = np.interp(image_relevances, (image_relevances.min(),
-                                                image_relevances.max()), 
-                                                (0, 1))
+# LRP
+lrp_result = apply_lrp_on_vgg16(model, image_tensor)
+lrp_heatmap = lrp_result.permute(0, 2, 3, 1).cpu().numpy()[0]
+lrp_heatmap = np.interp(lrp_heatmap, (lrp_heatmap.min(), lrp_heatmap.max()), (0, 1))
 
-# Apply Grad-CAM
-grad_cam = GradCAM(model, target_layer='features.29')  # Last conv layer in VGG16
+# Grad-CAM
 try:
-    cam_map = grad_cam(image_tensor.unsqueeze(0), class_idx=outputs[image_id])
-    
-    # Prepare original image for visualization
-    # Denormalize for visualization
-    inv_normalize = transforms.Normalize(
-        mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
-        std=[1/0.229, 1/0.224, 1/0.225]
-    )
-    orig_img = inv_normalize(image_tensor.cpu()).permute(1, 2, 0).numpy()
-    orig_img = np.clip(orig_img, 0, 1)
-    
-    # Create Grad-CAM heatmap overlay
-    cam_heatmap = np.uint8(255 * cam_map)
-    cam_heatmap = cv2.applyColorMap(cv2.resize(cam_heatmap, (224, 224)), cv2.COLORMAP_JET)
-    cam_heatmap = cv2.cvtColor(cam_heatmap, cv2.COLOR_BGR2RGB)
-    overlay = cv2.addWeighted(np.uint8(orig_img * 255), 0.6, cam_heatmap, 0.4, 0)
-    
-    # Get class names
-    class_names = ['glioma', 'meningioma', 'notumor', 'pituitary']
-    pred_label = class_names[outputs[image_id]]
-    true_label = class_names[labels[image_id]]
-    
-    # Show results
-    if outputs[image_id] == labels[image_id]:
-        print(f"Correctly classified as: {pred_label} (Ground truth: {true_label})")
-    else:
-        print(f"Wrongly classified as: {pred_label} (Ground truth: {true_label})")
-    
-    # Plot images in a 2x2 grid for comparison
-    fig, axes = plt.subplots(2, 2, figsize=(10, 10))
-    
-    # Original Image
-    axes[0,0].imshow(orig_img)
-    axes[0,0].set_title(f"Original MRI\n(True: {true_label}, Pred: {pred_label})")
-    axes[0,0].axis('off')
-    
-    # LRP Heatmap
-    axes[0,1].imshow(image_relevances[:,:,0], cmap="seismic", vmin=0, vmax=1)
-    axes[0,1].set_title("LRP Heatmap")
-    axes[0,1].axis('off')
-    
-    # Grad-CAM Heatmap
-    axes[1,0].imshow(cam_map, cmap="jet", vmin=0, vmax=1)
-    axes[1,0].set_title("Grad-CAM Heatmap")
-    axes[1,0].axis('off')
-    
-    # Grad-CAM Overlay
-    axes[1,1].imshow(overlay)
-    axes[1,1].set_title("Grad-CAM Overlay")
-    axes[1,1].axis('off')
-    
-    plt.tight_layout()
-    plt.show()
-    
+    grad_cam = GradCAM(model, target_layer_name='features.29')
+    cam_map = grad_cam(image_tensor.unsqueeze(0), class_idx=preds[image_id])
 except Exception as e:
-    print(f"Error in Grad-CAM: {e}")
-    print("This might be due to the target layer not being found or other issues.")
-    print("Trying with a different target layer...")
-    
-    # Try with a different target layer
+    print("Grad-CAM failed with features.29:", e)
     try:
-        grad_cam = GradCAM(model, target_layer='features.28')  # Alternative target layer
-        cam_map = grad_cam(image_tensor.unsqueeze(0), class_idx=outputs[image_id])
-        
-        # Prepare original image for visualization
-        inv_normalize = transforms.Normalize(
-            mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
-            std=[1/0.229, 1/0.224, 1/0.225]
-        )
-        orig_img = inv_normalize(image_tensor.cpu()).permute(1, 2, 0).numpy()
-        orig_img = np.clip(orig_img, 0, 1)
-        
-        # Create Grad-CAM heatmap overlay
-        cam_heatmap = np.uint8(255 * cam_map)
-        cam_heatmap = cv2.applyColorMap(cv2.resize(cam_heatmap, (224, 224)), cv2.COLORMAP_JET)
-        cam_heatmap = cv2.cvtColor(cam_heatmap, cv2.COLOR_BGR2RGB)
-        overlay = cv2.addWeighted(np.uint8(orig_img * 255), 0.6, cam_heatmap, 0.4, 0)
-        
-        # Get class names
-        class_names = ['glioma', 'meningioma', 'notumor', 'pituitary']
-        pred_label = class_names[outputs[image_id]]
-        true_label = class_names[labels[image_id]]
-        
-        # Show results
-        if outputs[image_id] == labels[image_id]:
-            print(f"Correctly classified as: {pred_label} (Ground truth: {true_label})")
-        else:
-            print(f"Wrongly classified as: {pred_label} (Ground truth: {true_label})")
-        
-        # Plot images in a 2x2 grid for comparison
-        fig, axes = plt.subplots(2, 2, figsize=(10, 10))
-        
-        # Original Image
-        axes[0,0].imshow(orig_img)
-        axes[0,0].set_title(f"Original MRI\n(True: {true_label}, Pred: {pred_label})")
-        axes[0,0].axis('off')
-        
-        # LRP Heatmap
-        axes[0,1].imshow(image_relevances[:,:,0], cmap="seismic", vmin=0, vmax=1)
-        axes[0,1].set_title("LRP Heatmap")
-        axes[0,1].axis('off')
-        
-        # Grad-CAM Heatmap
-        axes[1,0].imshow(cam_map, cmap="jet", vmin=0, vmax=1)
-        axes[1,0].set_title("Grad-CAM Heatmap")
-        axes[1,0].axis('off')
-        
-        # Grad-CAM Overlay
-        axes[1,1].imshow(overlay)
-        axes[1,1].set_title("Grad-CAM Overlay")
-        axes[1,1].axis('off')
-        
-        plt.tight_layout()
-        plt.show()
+        grad_cam = GradCAM(model, target_layer_name='features.28')
+        cam_map = grad_cam(image_tensor.unsqueeze(0), class_idx=preds[image_id])
     except Exception as e2:
-        print(f"Error with alternative target layer: {e2}")
-        print("LRP heatmap only:")
-        plt.figure(figsize=(5, 5))
-        plt.imshow(image_relevances[:,:,0], cmap="seismic", vmin=0, vmax=1)
-        plt.title("LRP Heatmap")
-        plt.axis('off')
-        plt.show()
+        print("Grad-CAM also failed with features.28:", e2)
+        cam_map = np.zeros((224, 224))
+
+# Denormalize image for display
+inv_normalize = transforms.Normalize(
+    mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
+    std=[1/0.229, 1/0.224, 1/0.225]
+)
+orig_img = inv_normalize(image_tensor.cpu()).permute(1, 2, 0).numpy()
+orig_img = np.clip(orig_img, 0, 1)
+
+# Overlay for Grad-CAM
+if cam_map.any():
+    cam_resized = cv2.resize(cam_map, (224, 224))
+    cam_heatmap_vis = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
+    cam_heatmap_vis = cv2.cvtColor(cam_heatmap_vis, cv2.COLOR_BGR2RGB)
+    overlay = cv2.addWeighted(np.uint8(orig_img * 255), 0.6, cam_heatmap_vis, 0.4, 0)
+else:
+    overlay = np.uint8(orig_img * 255)
+
+# Labels
+class_names = ['glioma', 'meningioma', 'notumor', 'pituitary']
+true_label = class_names[labels_np[image_id]]
+pred_label = class_names[preds[image_id]]
+
+# Plot
+fig, axes = plt.subplots(2, 2, figsize=(10, 10))
+
+axes[0, 0].imshow(orig_img)
+axes[0, 0].set_title(f"Original\n(True: {true_label}, Pred: {pred_label})")
+axes[0, 0].axis('off')
+
+axes[0, 1].imshow(lrp_heatmap[:, :, 0], cmap="seismic", vmin=0, vmax=1)
+axes[0, 1].set_title("LRP Heatmap")
+axes[0, 1].axis('off')
+
+axes[1, 0].imshow(cam_map, cmap="jet", vmin=0, vmax=1)
+axes[1, 0].set_title("Grad-CAM")
+axes[1, 0].axis('off')
+
+axes[1, 1].imshow(overlay)
+axes[1, 1].set_title("Grad-CAM Overlay")
+axes[1, 1].axis('off')
+
+plt.tight_layout()
+plt.savefig("xai_comparison.png", dpi=150, bbox_inches='tight')
+plt.show()
+
+print("Visualization saved as 'xai_comparison.png'")
