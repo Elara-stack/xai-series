@@ -243,18 +243,13 @@ lrp_result = apply_lrp_on_vgg16(model, image_tensor)
 lrp_heatmap = lrp_result.permute(0, 2, 3, 1).cpu().numpy()[0]
 lrp_heatmap = np.interp(lrp_heatmap, (lrp_heatmap.min(), lrp_heatmap.max()), (0, 1))
 
-# Grad-CAM
+# Grad-CAM —— layer name
 try:
-    grad_cam = GradCAM(model, target_layer_name='features.29')
+    grad_cam = GradCAM(model, target_layer_name='vgg16.features.28')
     cam_map = grad_cam(image_tensor.unsqueeze(0), class_idx=preds[image_id])
 except Exception as e:
-    print("Grad-CAM failed with features.29:", e)
-    try:
-        grad_cam = GradCAM(model, target_layer_name='features.28')
-        cam_map = grad_cam(image_tensor.unsqueeze(0), class_idx=preds[image_id])
-    except Exception as e2:
-        print("Grad-CAM also failed with features.28:", e2)
-        cam_map = np.zeros((224, 224))
+    print("Grad-CAM failed:", e)
+    cam_map = np.zeros((224, 224))
 
 # Denormalize image for display
 inv_normalize = transforms.Normalize(
