@@ -11,13 +11,11 @@ import copy
 import pandas as pd 
 import cv2
 from PIL import Image
-import torch.nn.functional as F
 
-# Set GPU device
 print("CUDA available:", torch.cuda.is_available())
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# %% Demo Dataset (fixed to return PIL Image)
+# %% Demo Dataset (returns PIL Image)
 class DemoDataset(torch.utils.data.Dataset):
     def __init__(self, num_samples=100, transform=None):
         self.num_samples = num_samples
@@ -27,10 +25,10 @@ class DemoDataset(torch.utils.data.Dataset):
         return self.num_samples
     
     def __getitem__(self, idx):
-        # Generate random RGB image as uint8 NumPy array (HWC)
+        # Random RGB image as uint8 (HWC)
         image_np = np.random.randint(0, 256, (224, 224, 3), dtype=np.uint8)
         image_pil = Image.fromarray(image_np)
-        label = np.random.randint(0, 4)  # 4 classes: 0,1,2,3
+        label = np.random.randint(0, 4)  # 4 classes
         if self.transform:
             image_pil = self.transform(image_pil)
         return image_pil, label
@@ -39,39 +37,31 @@ class DemoDataset(torch.utils.data.Dataset):
 train_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                        std=[0.229, 0.224, 0.225])
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-test_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                        std=[0.229, 0.224, 0.225])
-])
+test_transform = train_transform  # same for demo
 
-# %% Create demo datasets
+# %% Datasets & Loaders
 train_dataset = DemoDataset(num_samples=200, transform=train_transform)
 test_dataset = DemoDataset(num_samples=50, transform=test_transform)
 
-# %% Build model
+batch_size = 16
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+# %% Model
 class CNNModel(nn.Module):
     def __init__(self):
         super(CNNModel, self).__init__()
-        # Use newer PyTorch weights API
         self.vgg16 = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
-        in_feats = self.vgg16.classifier[6].in_features 
+        in_feats = self.vgg16.classifier[6].in_features
         self.vgg16.classifier[6] = nn.Linear(in_feats, 4)
 
     def forward(self, x):
         return self.vgg16(x)
 
 model = CNNModel().to(device)
-
-# %% Data Loaders
-batch_size = 16
-train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 # %% Training
 criterion = nn.CrossEntropyLoss()
@@ -82,7 +72,7 @@ print("Starting training...")
 model.train()
 for epoch in range(epochs):
     for i, (inputs, labels) in enumerate(train_loader):
-        if i > 10:  # Limit for demo speed
+        if i > 10:  # limit for speed
             break
         inputs, labels = inputs.to(device), labels.to(device)
         optimizer.zero_grad()
@@ -108,7 +98,52 @@ print("Batch accuracy:", (labels_np == preds).mean())
 comparison = pd.DataFrame({"labels": labels_np, "outputs": preds})
 print(comparison.head())
 
-# %% LRP Helper Functions
+# %% Grad-CAM Class (fixed hook name usage)
+class GradCAM:
+    def __init__(self, model, target_layer_name):
+        self.model = model
+        self.target_layer_name = target_layer_name
+        self.gradients = None
+        self.activations = None
+        self._register_hooks()
+
+    def _register_hooks(self):
+        def forward_hook(module, input, output):
+            self.activations = output.detach()
+        def backward_hook(module, grad_in, grad_out):
+            self.gradients = grad_out[0].detach()
+
+        found = False
+        for name, module in self.model.named_modules():
+            if name == self.target_layer_name:
+                module.register_forward_hook(forward_hook)
+                module.register_full_backward_hook(backward_hook)
+                found = True
+                break
+        if not found:
+            raise ValueError(f"Layer '{self.target_layer_name}' not found in model. "
+                             f"Available layers with 'features.28': {[n for n, _ in self.model.named_modules() if 'features.28' in n]}")
+
+    def __call__(self, input_tensor, class_idx=None):
+        self.model.zero_grad()
+        output = self.model(input_tensor)
+        if class_idx is None:
+            class_idx = output.argmax(dim=1).item()
+        one_hot = torch.zeros_like(output)
+        one_hot[0][class_idx] = 1.0
+        output.backward(gradient=one_hot, retain_graph=True)
+
+        if self.gradients is None:
+            raise RuntimeError("Gradients not captured. Hook may not have fired.")
+
+        weights = torch.mean(self.gradients, dim=[2, 3], keepdim=True)
+        cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
+        cam = torch.relu(cam)
+        cam = cam - cam.min()
+        cam = cam / (cam.max() + 1e-8)
+        return cam.squeeze().cpu().numpy()
+
+# %% LRP Helper Functions (unchanged)
 def new_layer(layer, g):
     layer = copy.deepcopy(layer)
     try: layer.weight = torch.nn.Parameter(g(layer.weight))
@@ -158,7 +193,6 @@ def apply_lrp_on_vgg16(model, image):
             out = torch.flatten(out, start_dim=1)
         activations[idx + 1] = out
 
-    # One-hot max output
     output_act = activations[-1].detach().cpu().numpy()
     max_val = output_act.max()
     one_hot = np.where(output_act == max_val, max_val, 0.0)
@@ -195,63 +229,25 @@ def apply_lrp_on_vgg16(model, image):
 
     return relevances[0]
 
-# %% Grad-CAM
-class GradCAM:
-    def __init__(self, model, target_layer_name):
-        self.model = model
-        self.target_layer_name = target_layer_name
-        self.gradients = None
-        self.activations = None
-        self._register_hooks()
-
-    def _register_hooks(self):
-        def forward_hook(module, input, output):
-            self.activations = output.detach()
-        def backward_hook(module, grad_in, grad_out):
-            self.gradients = grad_out[0].detach()
-
-        for name, module in self.model.named_modules():
-            if name == self.target_layer_name:
-                module.register_forward_hook(forward_hook)
-                module.register_full_backward_hook(backward_hook)
-
-    def __call__(self, input_tensor, class_idx=None):
-        self.model.zero_grad()
-        output = self.model(input_tensor)
-        if class_idx is None:
-            class_idx = output.argmax(dim=1).item()
-        one_hot = torch.zeros_like(output)
-        one_hot[0][class_idx] = 1.0
-        output.backward(gradient=one_hot, retain_graph=True)
-
-        if self.gradients is None:
-            raise RuntimeError("Gradients not captured. Check target_layer_name.")
-
-        weights = torch.mean(self.gradients, dim=[2, 3], keepdim=True)
-        cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
-        cam = torch.relu(cam)
-        cam = cam - cam.min()
-        cam = cam / (cam.max() + 1e-8)
-        return cam.squeeze().cpu().numpy()
-
 # %% Visualization
 image_id = 0
 image_tensor = inputs[image_id]
 
-# LRP
+# --- LRP ---
 lrp_result = apply_lrp_on_vgg16(model, image_tensor)
 lrp_heatmap = lrp_result.permute(0, 2, 3, 1).cpu().numpy()[0]
 lrp_heatmap = np.interp(lrp_heatmap, (lrp_heatmap.min(), lrp_heatmap.max()), (0, 1))
 
-# Grad-CAM —— layer name
+# --- Grad-CAM (FIXED) ---
 try:
+    # ✅ CORRECT LAYER NAME: 'vgg16.features.28'
     grad_cam = GradCAM(model, target_layer_name='vgg16.features.28')
     cam_map = grad_cam(image_tensor.unsqueeze(0), class_idx=preds[image_id])
 except Exception as e:
-    print("Grad-CAM failed:", e)
+    print("❌ Grad-CAM failed:", e)
     cam_map = np.zeros((224, 224))
 
-# Denormalize image for display
+# --- Denormalize image ---
 inv_normalize = transforms.Normalize(
     mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
     std=[1/0.229, 1/0.224, 1/0.225]
@@ -259,7 +255,7 @@ inv_normalize = transforms.Normalize(
 orig_img = inv_normalize(image_tensor.cpu()).permute(1, 2, 0).numpy()
 orig_img = np.clip(orig_img, 0, 1)
 
-# Overlay for Grad-CAM
+# --- Overlay for Grad-CAM ---
 if cam_map.any():
     cam_resized = cv2.resize(cam_map, (224, 224))
     cam_heatmap_vis = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
@@ -268,12 +264,11 @@ if cam_map.any():
 else:
     overlay = np.uint8(orig_img * 255)
 
-# Labels
+# --- Plot ---
 class_names = ['glioma', 'meningioma', 'notumor', 'pituitary']
 true_label = class_names[labels_np[image_id]]
 pred_label = class_names[preds[image_id]]
 
-# Plot
 fig, axes = plt.subplots(2, 2, figsize=(10, 10))
 
 axes[0, 0].imshow(orig_img)
@@ -296,4 +291,4 @@ plt.tight_layout()
 plt.savefig("xai_comparison.png", dpi=150, bbox_inches='tight')
 plt.show()
 
-print("Visualization saved as 'xai_comparison.png'")
+print("✅ Visualization saved as 'xai_comparison.png'")
