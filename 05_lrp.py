@@ -7,7 +7,6 @@ import torchvision.transforms as transforms
 import numpy as np
 import matplotlib.pyplot as plt
 import torch.optim as optim
-import copy
 import pandas as pd 
 import cv2
 from PIL import Image
@@ -62,6 +61,17 @@ class CNNModel(nn.Module):
 
 model = CNNModel().to(device)
 
+# Replace all MaxPool2d with AvgPool2d to avoid view/inplace issues in Grad-CAM and LRP
+def replace_maxpool_with_avgpool(module):
+    for name, child in module.named_children():
+        if isinstance(child, nn.MaxPool2d):
+            setattr(module, name, nn.AvgPool2d(kernel_size=2, stride=2))
+        else:
+            replace_maxpool_with_avgpool(child)
+
+replace_maxpool_with_avgpool(model)
+print("✅ All MaxPool2d replaced with AvgPool2d")
+
 # %% Training
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=1e-5)
@@ -97,7 +107,7 @@ print("Batch accuracy:", (labels_np == preds).mean())
 comparison = pd.DataFrame({"labels": labels_np, "outputs": preds})
 print(comparison.head())
 
-# %% Grad-CAM (FINAL FIXED VERSION - avoid MaxPool2d)
+# %% Grad-CAM (Safe version after MaxPool → AvgPool replacement)
 class GradCAM:
     def __init__(self, model, target_layer_name):
         self.model = model
@@ -108,11 +118,9 @@ class GradCAM:
 
     def _register_hooks(self):
         def forward_hook(module, input, output):
-            # Use clone to avoid view issues
             self.activations = output.clone().detach()
 
         def backward_hook(module, grad_in, grad_out):
-            # Clone before detach to prevent inplace modification
             self.gradients = grad_out[0].clone().detach()
 
         found = False
@@ -144,15 +152,10 @@ class GradCAM:
         cam = cam / (cam.max() + 1e-8)
         return cam.squeeze().cpu().numpy()
 
-# %% Simplified LRP (avoid MaxPool view issues)
+# %% Simplified LRP (now safe because MaxPool → AvgPool)
 def apply_lrp_on_vgg16(model, image):
     image = image.unsqueeze(0)
     layers = list(model.vgg16.features) + [model.vgg16.avgpool]
-    
-    # Replace MaxPool2d with AvgPool2d
-    for i, layer in enumerate(layers):
-        if isinstance(layer, nn.MaxPool2d):
-            layers[i] = nn.AvgPool2d(kernel_size=2, stride=2)
 
     classifier_layers = []
     for layer in model.vgg16.classifier:
@@ -168,29 +171,28 @@ def apply_lrp_on_vgg16(model, image):
                 newlayer.weight = nn.Parameter(layer.weight.reshape(n, m, 1, 1))
                 newlayer.bias = nn.Parameter(layer.bias)
             classifier_layers.append(newlayer)
-        else:
-            classifier_layers.append(layer)
+        elif isinstance(layer, nn.ReLU):
+            classifier_layers.append(nn.ReLU(inplace=False))  # avoid inplace
+        # Skip Dropout
 
-    layers.extend(classifier_layers)
-    layers.append(nn.Flatten())
+    full_layers = layers + classifier_layers + [nn.Flatten()]
 
-    # Forward
+    # Forward pass
     activations = [image]
-    for layer in layers:
+    for layer in full_layers:
         out = layer(activations[-1])
         activations.append(out)
 
-    # One-hot
+    # One-hot relevance at output
     output_act = activations[-1].detach().cpu().numpy()
     max_val = output_act.max()
     one_hot = np.where(output_act == max_val, max_val, 0.0)
-    activations[-1] = torch.FloatTensor(one_hot).to(device)
-
-    # Backward relevance
     relevances = [None] * len(activations)
-    relevances[-1] = activations[-1]
-    for idx in reversed(range(len(activations) - 1)):
-        current = layers[idx]
+    relevances[-1] = torch.FloatTensor(one_hot).to(device)
+
+    # Backward relevance propagation
+    for idx in reversed(range(len(full_layers))):
+        current = full_layers[idx]
         act = activations[idx].data.requires_grad_(True)
 
         if isinstance(current, (nn.Conv2d, nn.AvgPool2d)):
@@ -221,7 +223,7 @@ except Exception as e:
     print("❌ Grad-CAM failed:", e)
     cam_map = np.zeros((224, 224))
 
-# Denormalize
+# Denormalize original image
 inv_normalize = transforms.Normalize(
     mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
     std=[1/0.229, 1/0.224, 1/0.225]
@@ -229,7 +231,7 @@ inv_normalize = transforms.Normalize(
 orig_img = inv_normalize(image_tensor.cpu()).permute(1, 2, 0).numpy()
 orig_img = np.clip(orig_img, 0, 1)
 
-# Overlay
+# Overlay Grad-CAM
 if cam_map.any():
     cam_resized = cv2.resize(cam_map, (224, 224))
     cam_heatmap_vis = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
