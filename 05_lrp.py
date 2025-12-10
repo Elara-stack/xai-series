@@ -1,3 +1,4 @@
+%%writefile 05_lrp.py
 # %% Imports
 import torch
 import torch.nn as nn
