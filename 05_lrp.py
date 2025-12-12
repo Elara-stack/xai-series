@@ -14,12 +14,11 @@ from torch.utils.data import Dataset, DataLoader
 print("CUDA available:", torch.cuda.is_available())
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# %% Real Brain MRI Dataset (Match Your Folder Names)
+# %% Real Brain MRI Dataset
 class BrainMRIDataset(Dataset):
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
         self.transform = transform
-        # ✅ Use exact folder names from your data
         self.classes = ['glioma_tumor', 'meningioma_tumor', 'no_tumor', 'pituitary_tumor']
         self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(self.classes)}
         self.samples = []
@@ -51,7 +50,7 @@ train_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# %% Load dataset with correct paths
+# %% Load dataset
 DATA_ROOT_TRAIN = "data/brain_mri/training"
 DATA_ROOT_TEST = "data/brain_mri/testing"
 
@@ -60,7 +59,6 @@ if not os.path.exists(DATA_ROOT_TRAIN):
 if not os.path.exists(DATA_ROOT_TEST):
     raise FileNotFoundError(f"Testing directory not found: {DATA_ROOT_TEST}")
 
-# Load full datasets
 train_dataset = BrainMRIDataset(DATA_ROOT_TRAIN, transform=train_transform)
 test_dataset = BrainMRIDataset(DATA_ROOT_TEST, transform=train_transform)
 
@@ -81,7 +79,7 @@ class CNNModel(nn.Module):
 
 model = CNNModel().to(device)
 
-# Replace all MaxPool2d with AvgPool2d recursively
+# Replace MaxPool2d with AvgPool2d
 def replace_maxpool_with_avgpool(module):
     for name, child in module.named_children():
         if isinstance(child, nn.MaxPool2d):
@@ -114,7 +112,7 @@ for epoch in range(epochs):
 
 print("Training completed.")
 
-# %% Evaluation on a test batch
+# %% Evaluation
 model.eval()
 inputs, labels = next(iter(test_loader))
 inputs = inputs.to(device)
@@ -127,60 +125,7 @@ print("Batch accuracy:", (labels_np == preds).mean())
 comparison = pd.DataFrame({"labels": labels_np, "outputs": preds})
 print(comparison.head())
 
-# %% Grad-CAM: SAFE VERSION
-class GradCAM:
-    def __init__(self, model, target_layer_name):
-        self.model = model
-        self.target_layer_name = target_layer_name
-        self.activations = None
-        self._register_forward_hook()
-
-    def _register_forward_hook(self):
-        def forward_hook(module, input, output):
-            self.activations = output.detach()
-
-        found = False
-        for name, module in self.model.named_modules():
-            if isinstance(module, nn.Conv2d) and name == self.target_layer_name:
-                module.register_forward_hook(forward_hook)
-                found = True
-                break
-        if not found:
-            available_convs = [name for name, m in self.model.named_modules() if isinstance(m, nn.Conv2d)]
-            raise ValueError(
-                f"Layer '{self.target_layer_name}' not found.\n"
-                f"Available Conv2d layers:\n" + "\n".join(available_convs[:10]) + "..."
-            )
-
-    def __call__(self, input_tensor, class_idx=None):
-        self.model.eval()
-        with torch.enable_grad():
-            outputs = self.model(input_tensor)
-            if class_idx is None:
-                class_idx = outputs.argmax(dim=1).item()
-            one_hot = torch.zeros_like(outputs)
-            one_hot[0][class_idx] = 1.0
-
-            params = list(self.model.parameters())
-            grads = torch.autograd.grad(outputs, params, grad_outputs=one_hot, retain_graph=True, allow_unused=True)
-
-            target_grad = None
-            for (name, param), grad in zip(self.model.named_parameters(), grads):
-                if self.target_layer_name in name and 'weight' in name:
-                    target_grad = grad
-                    break
-
-            if target_grad is None or self.activations is None:
-                raise RuntimeError("Failed to capture activations or gradients.")
-
-            weights = torch.mean(target_grad, dim=[2, 3], keepdim=True)
-            cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
-            cam = torch.relu(cam)
-            cam = cam - cam.min()
-            cam = cam / (cam.max() + 1e-8)
-            return cam.squeeze().cpu().numpy()
-
-# %% LRP (same as before)
+# %% LRP (keep for comparison)
 def apply_lrp_on_vgg16(model, image):
     image = image.unsqueeze(0)
     layers = list(model.vgg16.features) + [model.vgg16.avgpool]
@@ -230,24 +175,83 @@ def apply_lrp_on_vgg16(model, image):
 
     return relevances[0]
 
+# %% ✅ RISE Implementation (Model-Agnostic)
+def generate_masks(n_masks=500, input_size=224, p1=0.5, seed=42):
+    """Generate random binary masks at coarse resolution and upsample."""
+    np.random.seed(seed)
+    cell_size = 8
+    n_cells = input_size // cell_size
+    masks = []
+    for _ in range(n_masks):
+        # Random coarse mask
+        coarse = (np.random.rand(n_cells, n_cells) < p1).astype(np.float32)
+        # Upsample to full size
+        fine = cv2.resize(coarse, (input_size, input_size), interpolation=cv2.INTER_NEAREST)
+        masks.append(fine)
+    return np.stack(masks)  # Shape: [N, H, W]
+
+def rise_explain(model, image_tensor, class_idx=None, n_masks=500, batch_size=32):
+    """
+    Compute RISE saliency map.
+    Args:
+        model: trained PyTorch model
+        image_tensor: normalized tensor of shape [3, H, W]
+        class_idx: target class index (int)
+        n_masks: number of random masks
+        batch_size: inference batch size
+    Returns:
+        saliency_map: numpy array [H, W], values in [0, 1]
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    H, W = image_tensor.shape[1], image_tensor.shape[2]
+    img = image_tensor.unsqueeze(0).to(device)  # [1, 3, H, W]
+
+    # Generate masks
+    masks = generate_masks(n_masks=n_masks, input_size=H, p1=0.5)
+
+    saliency = np.zeros((H, W), dtype=np.float32)
+
+    # Process in batches
+    for i in range(0, n_masks, batch_size):
+        end = min(i + batch_size, n_masks)  # 确保不超出范围
+        batch_masks = masks[i:end]  # [B, H, W]
+        B = len(batch_masks)
+        if B == 0:
+            continue
+        batch_imgs = img.repeat(B, 1, 1, 1) * torch.from_numpy(batch_masks).float().unsqueeze(1).to(device)  # [B, 3, H, W]
+
+        with torch.no_grad():
+            outputs = model(batch_imgs)  # [B, num_classes]
+            probs = torch.softmax(outputs, dim=1)  # [B, num_classes]
+            if class_idx is None:
+                class_idx = outputs[0].argmax().item()
+            scores = probs[:, class_idx].cpu().numpy()  # [B]
+
+        # Accumulate weighted masks —— 修复索引问题
+        for j, score in enumerate(scores):
+            saliency += score * batch_masks[j]  # 使用局部索引 j 而非全局索引 i+j
+
+    # Normalize by expected mask sum (n_masks * p1)
+    saliency = saliency / (n_masks * 0.5 + 1e-8)
+    # Clamp and normalize to [0, 1]
+    saliency = np.clip(saliency, 0, None)
+    saliency = (saliency - saliency.min()) / (saliency.max() - saliency.min() + 1e-8)
+    return saliency
+
 # %% Visualization
 image_id = 0
 image_tensor = inputs[image_id]
 
 # --- LRP ---
+print("Computing LRP...")
 lrp_result = apply_lrp_on_vgg16(model, image_tensor)
 lrp_heatmap = lrp_result.permute(0, 2, 3, 1).cpu().numpy()[0]
 lrp_heatmap = np.interp(lrp_heatmap, (lrp_heatmap.min(), lrp_heatmap.max()), (0, 1))
 
-# --- Grad-CAM ---
-cam_map = np.zeros((224, 224))
-try:
-    grad_cam = GradCAM(model, target_layer_name='vgg16.features.24')  # 👈 更早的层
-    raw_cam = grad_cam(image_tensor.unsqueeze(0), class_idx=preds[image_id])
-    if raw_cam is not None and raw_cam.size > 0:
-        cam_map = raw_cam
-except Exception as e:
-    print("❌ Grad-CAM failed:", e)
+# --- RISE ---
+print("Computing RISE... (this may take 10-30 seconds)")
+rise_saliency = rise_explain(model, image_tensor, class_idx=preds[image_id], n_masks=500)
 
 # Denormalize original image
 inv_normalize = transforms.Normalize(
@@ -257,21 +261,11 @@ inv_normalize = transforms.Normalize(
 orig_img = inv_normalize(image_tensor.cpu()).permute(1, 2, 0).numpy()
 orig_img = np.clip(orig_img, 0, 1)
 
-# --- Safe Grad-CAM Visualization ---
-if cam_map is not None and cam_map.size > 0:
-    if cam_map.ndim == 3:
-        cam_map = cam_map[0]
-    elif cam_map.ndim != 2:
-        cam_map = np.zeros((224, 224))
-    cam_normalized = (cam_map - cam_map.min()) / (cam_map.max() - cam_map.min() + 1e-8)
-    cam_uint8 = np.uint8(255 * cam_normalized)
-    cam_resized = cv2.resize(cam_uint8, (224, 224))
-    cam_heatmap_vis = cv2.applyColorMap(cam_resized, cv2.COLORMAP_JET)
-    cam_heatmap_vis = cv2.cvtColor(cam_heatmap_vis, cv2.COLOR_BGR2RGB)
-    overlay = cv2.addWeighted(np.uint8(orig_img * 255), 0.6, cam_heatmap_vis, 0.4, 0)
-else:
-    overlay = np.uint8(orig_img * 255)
-    cam_map = np.zeros((224, 224))
+# Create overlay
+rise_uint8 = np.uint8(255 * rise_saliency)
+rise_heatmap_vis = cv2.applyColorMap(rise_uint8, cv2.COLORMAP_JET)
+rise_heatmap_vis = cv2.cvtColor(rise_heatmap_vis, cv2.COLOR_BGR2RGB)
+overlay = cv2.addWeighted(np.uint8(orig_img * 255), 0.6, rise_heatmap_vis, 0.4, 0)
 
 # Plot
 class_names = ['glioma_tumor', 'meningioma_tumor', 'no_tumor', 'pituitary_tumor']
@@ -288,16 +282,16 @@ axes[0, 1].imshow(lrp_heatmap[:, :, 0], cmap="seismic", vmin=0, vmax=1)
 axes[0, 1].set_title("LRP Heatmap")
 axes[0, 1].axis('off')
 
-axes[1, 0].imshow(cam_map, cmap="jet", vmin=0, vmax=1)
-axes[1, 0].set_title("Grad-CAM")
+axes[1, 0].imshow(rise_saliency, cmap="jet", vmin=0, vmax=1)
+axes[1, 0].set_title("RISE Saliency")
 axes[1, 0].axis('off')
 
 axes[1, 1].imshow(overlay)
-axes[1, 1].set_title("Grad-CAM Overlay")
+axes[1, 1].set_title("RISE Overlay")
 axes[1, 1].axis('off')
 
 plt.tight_layout()
 plt.savefig("xai_comparison_real.png", dpi=150, bbox_inches='tight')
 plt.show()
 
-print("✅ Visualization saved as 'xai_comparison_real.png'")
+print("\n✅ Visualization saved as 'xai_comparison_real.png'")
