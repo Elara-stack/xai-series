@@ -250,8 +250,12 @@ lrp_heatmap = lrp_result.permute(0, 2, 3, 1).cpu().numpy()[0]
 lrp_heatmap = np.interp(lrp_heatmap, (lrp_heatmap.min(), lrp_heatmap.max()), (0, 1))
 
 # --- RISE ---
-print("Computing RISE... (this may take 10-30 seconds)")
-rise_saliency = rise_explain(model, image_tensor, class_idx=preds[image_id], n_masks=500)
+print("Computing RISE... (this may take 20-60 seconds with n_masks=1000)")
+# ✅ 修改 1: 增加掩码数量到 1000（更高精度）
+rise_saliency = rise_explain(model, image_tensor, class_idx=preds[image_id], n_masks=1000)
+
+# ✅ 修改 2: 对 RISE 热力图进行高斯平滑，消除棋盘噪声
+rise_saliency = cv2.GaussianBlur(rise_saliency, (5, 5), 0)
 
 # Denormalize original image
 inv_normalize = transforms.Normalize(
@@ -283,11 +287,11 @@ axes[0, 1].set_title("LRP Heatmap")
 axes[0, 1].axis('off')
 
 axes[1, 0].imshow(rise_saliency, cmap="jet", vmin=0, vmax=1)
-axes[1, 0].set_title("RISE Saliency")
+axes[1, 0].set_title("RISE Saliency (Smoothed)")
 axes[1, 0].axis('off')
 
 axes[1, 1].imshow(overlay)
-axes[1, 1].set_title("RISE Overlay")
+axes[1, 1].set_title("RISE Overlay (Smoothed)")
 axes[1, 1].axis('off')
 
 plt.tight_layout()
